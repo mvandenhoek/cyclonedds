@@ -15,6 +15,7 @@
 #include "dds/ddsrt/md5.h"
 #include "dds/ddsrt/io.h"
 #include "dds/ddsrt/heap.h"
+#include "dds/ddsrt/string.h"
 #include "dds/ddsrt/bswap.h"
 #include "dds/ddsrt/environ.h"
 #include "dds/ddsrt/static_assert.h"
@@ -33,6 +34,56 @@
 #include "Array100.h"
 #include "DynamicData.h"
 #include "PsmxDataModels.h"
+
+typedef struct sema_s{
+  ddsrt_mutex_t mutex;
+  ddsrt_cond_t cond;
+  ddsrt_atomic_uint32_t cnt;
+}sema_t;
+
+static void sema_init(sema_t* sema, uint32_t cnt){
+  ddsrt_mutex_init(&sema->mutex);
+  ddsrt_cond_init(&sema->cond);
+  ddsrt_atomic_st32(&sema->cnt, cnt);
+}
+
+static void sema_fini(sema_t* sema){
+  ddsrt_cond_destroy(&sema->cond);
+  ddsrt_mutex_destroy(&sema->mutex);
+}
+
+static bool sema_acquire(sema_t* sema, uint32_t decr, double timeout){
+  dds_time_t t0 = dds_time();
+  dds_duration_t timeout0 = (dds_duration_t)DDS_SECS(timeout);
+  dds_duration_t timeout_remainder = timeout0;
+  uint32_t cnt;
+  bool success = true;
+  do{
+    if ( (cnt = ddsrt_atomic_ld32(&sema->cnt)) < decr ) {
+      ddsrt_mutex_lock(&sema->mutex);
+      success = ddsrt_cond_waitfor(
+        &sema->cond, &sema->mutex, timeout_remainder
+      );
+      ddsrt_mutex_unlock(&sema->mutex);
+      timeout_remainder = timeout0 - (dds_time() - t0);
+      if ( timeout_remainder <= 0 ) {
+        success = false;
+      }
+      if ( !success ) {
+        break;
+      }
+      continue;
+    }
+  }while ( !ddsrt_atomic_cas32(&sema->cnt, cnt, cnt - decr) );
+  return success;
+}
+
+static void sema_release(sema_t* sema, uint32_t incr){
+  ddsrt_atomic_add32(&sema->cnt, incr);
+  ddsrt_mutex_lock(&sema->mutex);
+  ddsrt_cond_broadcast(&sema->cond);
+  ddsrt_mutex_unlock(&sema->mutex);
+}
 
 const uint32_t test_index_start = 0;
 const uint32_t test_index_end = UINT32_MAX;
@@ -97,6 +148,67 @@ ${CYCLONEDDS_URI}${CYCLONEDDS_URI:+,}\
   const dds_entity_t pp = dds_create_participant (int_dom, NULL, NULL);
   CU_ASSERT_FATAL (pp > 0);
   return pp;
+}
+
+static void config_psmx_free_content(struct ddsi_config_psmx* cfg)
+{
+  assert(cfg);
+  ddsrt_free(cfg->name);
+  ddsrt_free(cfg->library);
+  ddsrt_free(cfg->config);
+}
+
+static void config_psmx_elm_free(struct ddsi_config_psmx_listelem* elm)
+{
+  assert(elm);
+  config_psmx_free_content(&elm->cfg);
+  ddsrt_free(elm);
+}
+
+static bool domain_pin(dds_entity_t domain, dds_domain** dom_out)
+{
+  dds_entity* x = NULL;
+  dds_return_t rc = dds_entity_pin(domain, &x);
+  if ( rc == DDS_RETCODE_OK && dds_entity_kind(x) == DDS_KIND_DOMAIN ) {
+    *dom_out = (dds_domain*)x;
+    return true;
+  }
+  return false;
+}
+
+static void domain_unpin(dds_domain* dom)
+{
+  assert(dom);
+  dds_entity_unpin((dds_entity*)dom);
+}
+
+static bool domain_get_psmx_locator(dds_entity_t domain, ddsi_locator_t* l_out)
+{
+  dds_domain* dom = NULL;
+  bool ret = domain_pin(domain, &dom);
+  if ( ret ) {
+    memcpy(l_out, dom->psmx_instances.instances[0]->locator, sizeof(ddsi_locator_t));
+    domain_unpin(dom);
+  }
+  return ret;
+}
+
+static bool domain_has_psmx_instance_name(dds_entity_t domain, const char* inst_name)
+{
+  dds_domain* dom = NULL;
+  bool ret = domain_pin(domain, &dom);
+  bool match = false;
+  if ( ret ) {
+    uint32_t len = dom->psmx_instances.length;
+    for (uint32_t idx = 0; idx < len; ++idx) {
+      if ( strcmp(dom->psmx_instances.instances[idx]->instance_name, inst_name) == 0 ) {
+        match = true;
+        break;
+      }
+    }
+    domain_unpin(dom);
+  }
+  return ret && match;
 }
 
 struct tracebuf {
@@ -1263,6 +1375,474 @@ CU_Test (ddsc_psmx, basic)
 
   SC_Model_free (samples[0], DDS_FREE_ALL);
   dds_delete (dds_get_parent (participant));
+}
+
+#define sample_cnt 8
+
+struct data_available_bug_reproducer_ctx{
+  dds_entity_t participant;
+  dds_entity_t reader;
+  dds_entity_t writer;
+  sema_t mainsema;
+  sema_t workersema;
+  ddsrt_atomic_uint32_t proceed;
+  bool pass;
+};
+
+static uint32_t data_available_bug_reproducer_sub(void* arg)
+{
+  struct data_available_bug_reproducer_ctx* ctx = (
+    (struct data_available_bug_reproducer_ctx*)arg
+  );
+  bool pass = true;
+  const dds_entity_t ws = dds_create_waitset(ctx->participant);
+  dds_entity_t rcond = dds_create_readcondition(ctx->reader, DDS_ANY_STATE);
+  dds_waitset_attach(ws, rcond, rcond);
+  while ( true ) {
+    printf("sub: start working\n");
+    dds_return_t result;
+    PsmxType1* samples[sample_cnt];
+    dds_sample_info_t sinfo[sample_cnt];
+    memset(samples, 0x0, sizeof(samples));
+
+    uint32_t status_a = 0, status_b = 0;
+    dds_return_t result_a, result_b;
+    int j = 0;
+    int cnt = 0;
+    bool match = true;
+    while ( match && cnt < sample_cnt ) {
+      result = dds_waitset_wait(ws, NULL, 0, DDS_SECS(1));
+      if ( result <= 0 ) {
+        if ( result == 0 ) {
+          printf("ERROR: wait timeout\n");
+        } else {
+          printf("ERROR: wait error\n");
+        }
+        pass = false;
+        break;
+      }
+      result_a = dds_take_status(ctx->reader, &status_a, 0);
+      result = dds_take(ctx->reader, (void**)samples, sinfo, sample_cnt, sample_cnt);
+      result_b = dds_take_status(ctx->reader, &status_b, 0);
+      CU_ASSERT_FATAL(result_a == DDS_RETCODE_OK && result_b == DDS_RETCODE_OK);
+      printf("cnt: %i, take cnt: %i\n", cnt, result);
+      printf("reader status before, after:  %u, %u\n", status_a, status_b);
+
+      CU_ASSERT_FATAL(result > 0);
+      for (int i = 0; i < result; ++i) {
+        if ( !sinfo[i].valid_data ) {
+          printf("sample: invalid data\n");
+          match = false;
+        } else {
+          j = cnt + i;
+          if (
+            samples[i]->xy.x != j ||
+            samples[i]->xy.y != (uint8_t)j + 1 ||
+            samples[i]->z != (uint8_t)j + 2
+          ) {
+            match = false;
+          }
+        }
+      }
+      cnt += result;
+    }
+    if ( !pass ) {
+      break;
+    }
+    CU_ASSERT_FATAL(match);
+    CU_ASSERT_FATAL(cnt == sample_cnt);
+
+    if ( (status_b & DDS_DATA_AVAILABLE_STATUS) == DDS_DATA_AVAILABLE_STATUS ) {
+      /*
+      Note: If status_b after dds_take() still gives DATA_AVAILABLE,
+      then apparently there is more data, which is unexpected, so I want to see it.
+      */
+      result = dds_take(ctx->reader, (void**)samples, sinfo, sample_cnt, sample_cnt);
+      printf("cnt: %i, take cnt: %i\n", cnt, result);
+      if ( result <= 0 ) {
+        if ( result == 0 ) {
+          printf("ERROR: Called take() after DATA_AVAILABLE, but there are no samples.\n");
+        } else {
+          printf("ERROR: take error\n");
+        }
+      }
+      for (int i = 0; i < result; ++i) {
+        if ( !sinfo[i].valid_data ) {
+          printf("sample: invalid data\n");
+        } else {
+          printf("sample: %i, %u, %u\n",
+            samples[i]->xy.x,
+            samples[i]->xy.y,
+            samples[i]->z
+          );
+        }
+      }
+      pass = false;
+      break;
+    }
+    printf("sub: signal\n");
+    sema_release(&ctx->mainsema, 1);
+    printf("sub: wait\n");
+    if ( !sema_acquire(&ctx->workersema, 1, 10) ) {
+      break;
+    }
+    ddsrt_atomic_fence_acq();
+    if ( !(bool)ddsrt_atomic_ld32(&ctx->proceed) ) {
+      break;
+    }
+  }
+  ctx->pass = pass;
+  ddsrt_atomic_st32(&ctx->proceed, (uint32_t)false);
+  ddsrt_atomic_fence_rel();
+  sema_release(&ctx->mainsema, 1);
+  sema_release(&ctx->workersema, 1);
+
+  printf("sub: exit\n");
+  return 0;
+}
+
+static uint32_t data_available_bug_reproducer_pub(void* arg)
+{
+  struct data_available_bug_reproducer_ctx* ctx = (
+    (struct data_available_bug_reproducer_ctx*)arg
+  );
+  while ( true ) {
+    printf("pub: start working\n");
+    dds_return_t result;
+    PsmxType1* sample;
+    for (int i = 0; i < sample_cnt; ++i) {
+      result = dds_request_loan(ctx->writer, (void**)&sample);
+      CU_ASSERT_FATAL(result == DDS_RETCODE_OK);
+      sample->xy.x = i;
+      sample->xy.y = (uint8_t)i + 1;
+      sample->z = (uint8_t)i + 2;
+      result = dds_write(ctx->writer, sample);
+      CU_ASSERT_FATAL(result == DDS_RETCODE_OK);
+    }
+    printf("pub: signal\n");
+    sema_release(&ctx->mainsema, 1);
+    printf("pub: wait\n");
+    if ( !sema_acquire(&ctx->workersema, 1, 10) ) {
+      break;
+    }
+    ddsrt_atomic_fence_acq();
+    if ( !(bool)ddsrt_atomic_ld32(&ctx->proceed) ) {
+      break;
+    }
+  }
+  printf("pub: exit\n");
+  sema_release(&ctx->mainsema, 1);
+  return 0;
+}
+
+CU_Test(ddsc_psmx, data_available_bug_reproducer)
+{
+  {
+    // Check that the data types I'm planning to use are actually suitable for use with shared memory.
+    dds_data_type_properties_t props;
+    props = dds_stream_data_types(PsmxType1_desc.m_ops);
+    CU_ASSERT_FATAL((props & DDS_DATA_TYPE_IS_MEMCPY_SAFE) == DDS_DATA_TYPE_IS_MEMCPY_SAFE);
+  }
+
+  const dds_domainid_t domainId = 42;
+  char* CDDS_PSMX_NAME = ddsrt_expand_envvars("${CDDS_PSMX_NAME:-cdds}", domainId);
+  bool using_psmx_iox = (strcmp(CDDS_PSMX_NAME, "iox") == 0);
+  printf("CDDS_PSMX_NAME: '%s'\n", CDDS_PSMX_NAME);
+  ddsrt_free(CDDS_PSMX_NAME);
+  printf("using iox ?: %i\n", (int)using_psmx_iox);
+
+  if ( using_psmx_iox ) {
+    // Test case using a config with specified locator.
+    uint8_t locator_in[16];
+    ((uint64_t*)locator_in)[0] = (uint64_t)0x4a4d203df6996395;
+    ((uint64_t*)locator_in)[1] = (uint64_t)0xe1412fbecc2de4b6;
+    char config_str[100];
+    {
+      // Create the config string including a locator.
+      char locator_str[50];
+      uint8_t* l = locator_in;
+      snprintf(
+        locator_str,
+        sizeof(locator_str),
+        "LOCATOR=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+        l[0], l[1], l[2], l[3], l[4], l[5], l[6], l[7], l[8], l[9], l[10], l[11], l[12], l[13], l[14], l[15]
+      );
+      snprintf(
+        config_str,
+        sizeof(config_str),
+        "SERVICE_NAME=psmx1;%s",
+        locator_str
+      );
+      printf("locator_str: [%s]\n", locator_str);
+    }
+    dds_entity_t domain = -1;
+    {
+      // Create domain
+      struct ddsi_config cfg;
+      ddsi_config_init_default(&cfg);
+      cfg.psmx_instances = ddsrt_malloc(sizeof(*cfg.psmx_instances));
+      cfg.psmx_instances->cfg.name = ddsrt_strdup("iox");
+      cfg.psmx_instances->cfg.library = ddsrt_strdup("psmx_iox");
+      cfg.psmx_instances->cfg.config = ddsrt_strdup(config_str); // config including a locator
+      cfg.psmx_instances->cfg.priority.isdefault = 1;
+      cfg.psmx_instances->cfg.priority.value = 1000000;
+      cfg.psmx_instances->next = NULL;
+      domain = dds_create_domain_with_rawconfig(domainId, &cfg);
+      config_psmx_elm_free(cfg.psmx_instances);
+    }
+    CU_ASSERT_FATAL(domain > 0);
+    CU_ASSERT_FATAL(domain_has_psmx_instance_name(domain, "CycloneDDS-IOX-PSMX"));
+    dds_entity_t participant = dds_create_participant(domainId, NULL, NULL);
+    CU_ASSERT_FATAL(participant > 0);
+    dds_entity_t writer1, reader1, writer2, reader2;
+    {
+      char topicname[100];
+      dds_qos_t* qos = dds_create_qos();
+      dds_qset_history(qos, DDS_HISTORY_KEEP_LAST, sample_cnt);
+
+      create_unique_topic_name("shared_memory", topicname, sizeof(topicname));
+      dds_entity_t topic1 = dds_create_topic(participant, &SC_Model_desc, topicname, qos, NULL);
+      CU_ASSERT_FATAL(topic1 > 0);
+
+      writer1 = dds_create_writer(participant, topic1, qos, NULL);
+      CU_ASSERT_FATAL(writer1 > 0);
+
+      reader1 = dds_create_reader(participant, topic1, qos, NULL);
+      CU_ASSERT_FATAL(reader1 > 0);
+
+      create_unique_topic_name("shared_memory", topicname, sizeof(topicname));
+      dds_entity_t topic2 = dds_create_topic(participant, &PsmxType1_desc, topicname, qos, NULL);
+      CU_ASSERT_FATAL(topic2 > 0);
+
+      writer2 = dds_create_writer(participant, topic2, qos, NULL);
+      CU_ASSERT_FATAL(writer2 > 0);
+
+      reader2 = dds_create_reader(participant, topic2, qos, NULL);
+      CU_ASSERT_FATAL(reader2 > 0);
+      dds_delete_qos(qos);
+    }
+    {
+      // Check that shared memory is enabled.
+      bool psmx_enabled;
+      psmx_enabled = endpoint_has_psmx_enabled(writer1);
+      CU_ASSERT_FATAL(psmx_enabled);
+      CU_ASSERT_FATAL(dds_is_shared_memory_available(writer1));
+
+      psmx_enabled = endpoint_has_psmx_enabled(reader1);
+      CU_ASSERT_FATAL(psmx_enabled);
+      CU_ASSERT_FATAL(dds_is_shared_memory_available(reader1));
+
+      psmx_enabled = endpoint_has_psmx_enabled(writer2);
+      CU_ASSERT_FATAL(psmx_enabled);
+      CU_ASSERT_FATAL(dds_is_shared_memory_available(writer2));
+
+      psmx_enabled = endpoint_has_psmx_enabled(reader2);
+      CU_ASSERT_FATAL(psmx_enabled);
+      CU_ASSERT_FATAL(dds_is_shared_memory_available(reader2));
+    }
+    {
+      // Check that I get the same locator that I provided with the config.
+      ddsi_locator_t locator_out;
+      CU_ASSERT_FATAL(domain_get_psmx_locator(domain, &locator_out));
+      CU_ASSERT_FATAL(memcmp(locator_in, locator_out.address, sizeof(locator_in)) == 0);
+    }
+    bool pass = true;
+    size_t iteration = 0;
+    const size_t iteration_max = 200;
+    while ( pass && ++iteration < iteration_max) {
+      // Write and read samples
+
+      dds_return_t result;
+      dds_sample_info_t sinfo[sample_cnt];
+
+      PsmxType1* sample;
+      PsmxType1* samples2[sample_cnt];
+      for (int i = 0; i < sample_cnt; ++i) {
+        result = dds_request_loan(writer2, (void**)&sample);
+        CU_ASSERT_FATAL(result == DDS_RETCODE_OK);
+        sample->xy.x = i;
+        sample->xy.y = (uint8_t)i + 1;
+        sample->z = (uint8_t)i + 2;
+        result = dds_write(writer2, sample);
+        CU_ASSERT_FATAL(result == DDS_RETCODE_OK);
+      }
+
+      {
+        memset(samples2, 0x0, sizeof(samples2));
+        const dds_entity_t ws2 = dds_create_waitset(participant);
+        dds_entity_t rcond2 = dds_create_readcondition(reader2, DDS_ANY_STATE);
+        dds_waitset_attach(ws2, rcond2, rcond2);
+
+        uint32_t status_a = 0, status_b = 0;
+        dds_return_t result_a, result_b;
+        int j = 0;
+        int cnt = 0;
+        bool match = true;
+        printf("DDS_DATA_AVAILABLE_STATUS: %u\n", DDS_DATA_AVAILABLE_STATUS);
+        while ( match && cnt < sample_cnt ) {
+          result = dds_waitset_wait(ws2, NULL, 0, DDS_SECS(1));
+          if ( result <= 0 ) {
+            if ( result == 0 ) {
+              printf("ERROR: wait timeout\n");
+            } else {
+              printf("ERROR: wait error\n");
+            }
+            pass = false;
+            break;
+          }
+          result_a = dds_take_status(reader2, &status_a, 0);
+          result = dds_take(reader2, (void**)samples2, sinfo, sample_cnt, sample_cnt);
+          result_b = dds_take_status(reader2, &status_b, 0);
+          CU_ASSERT_FATAL(result_a == DDS_RETCODE_OK && result_b == DDS_RETCODE_OK);
+          printf("cnt: %i, take cnt: %i\n", cnt, result);
+          printf("reader status before, after:  %u, %u\n", status_a, status_b);
+
+          CU_ASSERT_FATAL(result > 0);
+          for (int i = 0; i < result; ++i) {
+            if ( !sinfo[i].valid_data ) {
+              printf("sample: invalid data\n");
+              match = false;
+            } else {
+              j = cnt + i;
+              if (
+                samples2[i]->xy.x != j ||
+                samples2[i]->xy.y != (uint8_t)j + 1 ||
+                samples2[i]->z != (uint8_t)j + 2
+              ) {
+                match = false;
+              }
+            }
+          }
+          cnt += result;
+        }
+        if ( !pass ) {
+          break;
+        }
+        CU_ASSERT_FATAL(match);
+        CU_ASSERT_FATAL(cnt == sample_cnt);
+
+        if ( status_b == DDS_DATA_AVAILABLE_STATUS ) {
+          /*
+          Note: If status_b after dds_take() still gives DATA_AVAILABLE,
+          then apparently there is more data, which is unexpected, so I want to see it.
+          */
+          result = dds_take(reader2, (void**)samples2, sinfo, sample_cnt, sample_cnt);
+          printf("cnt: %i, take cnt: %i\n", cnt, result);
+          // CU_ASSERT_FATAL(result > 0);
+          if ( result <= 0 ) {
+            if ( result == 0 ) {
+              printf("ERROR: Called take() after DATA_AVAILABLE, but there are no samples.\n");
+            } else {
+              printf("ERROR: take error\n");
+            }
+            pass = false;
+            break;
+          }
+          for (int i = 0; i < result; ++i) {
+            if ( !sinfo[i].valid_data ) {
+              printf("sample: invalid data\n");
+            } else {
+              printf("sample: %i, %u, %u\n",
+                samples2[i]->xy.x,
+                samples2[i]->xy.y,
+                samples2[i]->z
+              );
+            }
+          }
+          pass = false;
+        }
+      }
+    }
+    if ( pass ) {
+      printf("VERDICT: PASS\n");
+    } else {
+      printf("VERDICT: FAIL\n");
+    }
+    printf("iteration: %lu\n", iteration);
+    CU_ASSERT_FATAL(pass);
+    dds_delete(domain);
+  }
+  else {
+    // Test case without Iceoryx, using a subscriber and publisher thread.
+    dds_entity_t domain = -1;
+    dds_entity_t participant = dds_create_participant(domainId, NULL, NULL);
+    CU_ASSERT_FATAL(participant > 0);
+    domain = dds_get_parent(participant);
+    CU_ASSERT_FATAL(domain > 0);
+    dds_entity_t writer2, reader2;
+    struct data_available_bug_reproducer_ctx ctx;
+    const uint32_t workerthreadcnt = 2;
+    {
+      char topicname[100];
+      dds_qos_t* qos = dds_create_qos();
+      dds_qset_history(qos, DDS_HISTORY_KEEP_LAST, sample_cnt);
+
+      create_unique_topic_name("shared_memory", topicname, sizeof(topicname));
+      dds_entity_t topic2 = dds_create_topic(participant, &PsmxType1_desc, topicname, qos, NULL);
+      CU_ASSERT_FATAL(topic2 > 0);
+
+      writer2 = dds_create_writer(participant, topic2, qos, NULL);
+      CU_ASSERT_FATAL(writer2 > 0);
+
+      reader2 = dds_create_reader(participant, topic2, qos, NULL);
+      CU_ASSERT_FATAL(reader2 > 0);
+      dds_delete_qos(qos);
+      ctx.participant = participant;
+      ctx.reader = reader2;
+      ctx.writer = writer2;
+      sema_init(&ctx.mainsema, 0);
+      sema_init(&ctx.workersema, 0);
+      ddsrt_atomic_st32(&ctx.proceed, (uint32_t)true);
+      ctx.pass = true;
+    }
+    ddsrt_threadattr_t attr;
+    ddsrt_thread_t thr_sub, thr_pub;
+    ddsrt_threadattr_init(&attr);
+    ddsrt_thread_create(&thr_sub, "sub", &attr, data_available_bug_reproducer_sub, &ctx);
+    ddsrt_thread_create(&thr_pub, "pub", &attr, data_available_bug_reproducer_pub, &ctx);
+    bool pass = true;
+    size_t iteration = 0;
+    size_t iteration_max = 200;
+    double timeout = 10;
+    while ( pass && ++iteration < iteration_max ) {
+      /*
+      The worker threads have started a round of work.
+      When they are done, they will signal main and wait for orders.
+      */
+      printf("########### main: waiting ############\n");
+      pass = sema_acquire(&ctx.mainsema, workerthreadcnt, timeout);
+      if ( !pass ) {
+        printf("ERROR: sema_acquire() timeout\n");
+        break;
+      }
+      ddsrt_atomic_fence_acq();
+      pass = (bool)ddsrt_atomic_ld32(&ctx.proceed);
+      if ( !pass ) {
+        break;
+      }
+      // Signal worker threads to do another round of work.
+      printf("########### main: signal  ############\n");
+      sema_release(&ctx.workersema, workerthreadcnt);
+    }
+    ddsrt_atomic_st32(&ctx.proceed, (uint32_t)false);
+    ddsrt_atomic_fence_rel();
+    sema_release(&ctx.workersema, workerthreadcnt);
+    printf("main: join\n");
+    ddsrt_thread_join(thr_sub, NULL);
+    ddsrt_thread_join(thr_pub, NULL);
+    sema_fini(&ctx.mainsema);
+    sema_fini(&ctx.workersema);
+    pass = pass && ctx.pass;
+    if ( pass ) {
+      printf("VERDICT: PASS\n");
+    } else {
+      printf("VERDICT: FAIL\n");
+    }
+    printf("iteration: %lu\n", iteration);
+    CU_ASSERT_FATAL(pass);
+    dds_delete(domain);
+  }
+  #undef sample_cnt
 }
 
 CU_Test (ddsc_psmx, zero_copy)
