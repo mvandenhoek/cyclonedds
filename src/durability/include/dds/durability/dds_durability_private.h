@@ -11,14 +11,14 @@
 #ifndef DDS_DURABILITY_PRIVATE_H
 #define DDS_DURABILITY_PRIVATE_H
 
-#include "dds/export.h"
+#include "durability_export.h"
 #include "dds/durability/dds_durability_public.h"
 
 #if defined (__cplusplus)
 extern "C" {
 #endif
 
-DDS_EXPORT void dds_durability_creator(dds_durability_t* ds);
+DDS_DURABILITY_EXPORT void dds_durability_creator(dds_durability_t* ds);
 
 #if defined (__cplusplus)
 }

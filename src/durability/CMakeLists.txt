@@ -8,9 +8,11 @@
 #
 # SPDX-License-Identifier: EPL-2.0 OR BSD-3-Clause
 
+include(GenerateExportHeader)
 idlc_generate(TARGET dcidl FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/durablesupport.idl")
 add_library(durability SHARED "${CMAKE_CURRENT_SOURCE_DIR}/src/dds_durability.c")
 set_property(TARGET durability PROPERTY C_VISIBILITY_PRESET hidden)
+generate_export_header(durability BASE_NAME DDS_DURABILITY EXPORT_FILE_NAME "${CMAKE_CURRENT_BINARY_DIR}/include/durability_export.h")
 target_include_directories(durability PRIVATE
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>"
@@ -20,8 +22,9 @@ target_include_directories(durability PRIVATE
   "$<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/src/core/cdr/include>"
   "$<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/src/ddsrt/include>"
   "$<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/src/core/include>"
+  "$<BUILD_INTERFACE:${CMAKE_BINARY_DIR}/src/durability/include>"
 )
-target_link_libraries(durability PRIVATE dcidl)
+target_link_libraries(durability PRIVATE dcidl ddsc)
 
 install(
   TARGETS durability
